@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Taskflow",
+    "slug": "taskflow",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#F6F7F2"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "plugins": [
+      "expo-status-bar",
+      [
+        "expo-notifications",
+        {
+          "sounds": ["./assets/task-reminder.mpeg"]
+        }
+      ]
+    ]
+  }
+}
