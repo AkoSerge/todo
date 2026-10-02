@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Taskflow",
-    "slug": "taskflow",
+    "name": "Todo",
+    "slug": "todo",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -17,9 +17,34 @@
       [
         "expo-notifications",
         {
-          "sounds": ["./assets/task-reminder.mpeg"]
+          "sounds": [
+            "./assets/task_reminder.mp3"
+          ]
         }
-      ]
-    ]
+      ],
+      "@react-native-google-signin/google-signin",
+      "@react-native-community/datetimepicker"
+    ],
+    "android": {
+      "package": "com.lumero4.taskflow",
+      "googleServicesFile": "./google-services.json",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#FFFFFF"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.lumero4.taskflow"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "8e43ba1d-d781-4b4c-a103-82b2446ba32b"
+      }
+    },
+    "owner": "ndimakos-team",
+    "icon": "./assets/icon.png",
+    "web": {
+      "favicon": "./assets/logo.png"
+    }
   }
 }

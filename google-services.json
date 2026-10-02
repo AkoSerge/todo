@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "716648589373",
+    "project_id": "todo-bf1c4",
+    "storage_bucket": "todo-bf1c4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:716648589373:android:abc1aeffcb56e68397e254",
+        "android_client_info": {
+          "package_name": "com.lumero4.taskflow"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDb-TmEd4HWunlzyzSoqHd0wbuDAq-Vr-A"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
