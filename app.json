@@ -18,7 +18,7 @@
         "expo-notifications",
         {
           "sounds": [
-            "./assets/task_reminder.mp3"
+            "./assets/love_sms.mp3"
           ]
         }
       ],

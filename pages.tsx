@@ -14,6 +14,17 @@ export type Task = {
   deadline?: number;
   notificationId?: string;
   startedAt?: number;
+  createdAt?: number;
+  // Ticked on the Reminders screen: remind every 20% of the time until the deadline.
+  frequentReminders?: boolean;
+  // Otherwise: remind this many minutes before the deadline (unset = the default "% of time left").
+  customReminderMinutes?: number;
+  // Notifications scheduled on this phone for the deadline at scheduledFor.
+  scheduledFor?: number;
+  alertIds?: string[];
+  // Started duration timer: when it runs out and its "Time's up" notification.
+  timerEndsAt?: number;
+  timerNotificationId?: string;
 };
 
 export type TaskTab = 'ongoing' | 'completed';

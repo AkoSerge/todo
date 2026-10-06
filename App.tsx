@@ -42,6 +42,7 @@ import {
 import LandingPage from './landing';
 import { Palette, ThemeProvider, useTheme } from './theme';
 import { googleUserId, localUserId, openSession, saveTasks, type SessionMode, type UserRecord } from './api';
+import { DEFAULT_REMINDER_PERCENT, formatMinutes, planTaskNotifications } from './notifications';
 
 const Notifications: typeof NotificationsModule | null = Constants.appOwnership === 'expo'
   ? null
@@ -137,11 +138,13 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
   const [scheduledDate, setScheduledDate] = useState('');
   const [scheduledTime, setScheduledTime] = useState('');
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
-  const [menuTaskId, setMenuTaskId] = useState<string | null>(null);
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [isReminderOpen, setIsReminderOpen] = useState(false);
-  const [reminderTaskIds, setReminderTaskIds] = useState<string[]>([]);
+  const defaultReminderPercent = DEFAULT_REMINDER_PERCENT;
+  const [reminderChoice, setReminderChoice] = useState<'auto' | 'every20' | 'custom' | number>('auto');
+  const [customReminderDraft, setCustomReminderDraft] = useState('');
   const [profileFilter, setProfileFilter] = useState<ProfileFilter>('Pending');
   const [now, setNow] = useState(Date.now());
   const addButtonPosition = React.useRef(new Animated.ValueXY()).current;
@@ -191,14 +194,32 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     Notifications.setNotificationHandler({
       handleNotification: async () => ({ shouldPlaySound: true, shouldSetBadge: false, shouldShowBanner: true, shouldShowList: true }),
     });
-    Notifications.setNotificationChannelAsync('task-reminders-custom', {
+    // Android fixes a channel's sound when it is created, so a new sound needs a new channel id.
+    Notifications.deleteNotificationChannelAsync('task-reminders-custom').catch(() => undefined);
+    Notifications.setNotificationChannelAsync('task-alerts-love-sms', {
       name: 'Task reminders',
       importance: Notifications.AndroidImportance.HIGH,
-      sound: 'task_reminder.mp3',
+      sound: 'love_sms.mp3',
       vibrationPattern: [0, 500, 250, 500, 250, 700],
       enableVibrate: true,
     });
+
+    // Every reminder also shows an alert: when it arrives while the app is open, or when it is tapped.
+    const alerted = new Set<string>();
+    const showAlert = (notification: NotificationsModule.Notification) => {
+      const { identifier, content } = notification.request;
+      if (alerted.has(identifier)) return;
+      alerted.add(identifier);
+      Alert.alert(content.title ?? 'Todo', content.body ?? '');
+    };
+    const received = Notifications.addNotificationReceivedListener(showAlert);
+    const tapped = Notifications.addNotificationResponseReceivedListener((response) => showAlert(response.notification));
+    return () => {
+      received.remove();
+      tapped.remove();
+    };
   }, []);
+
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -338,6 +359,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
   }
 
   async function logout() {
+    await Notifications?.cancelAllScheduledNotificationsAsync().catch(() => undefined);
     await GoogleAuth?.GoogleSignin.signOut().catch(() => undefined);
     await AsyncStorage.multiRemove(['taskflow.username', 'taskflow.phone', 'taskflow.userId']);
     setTasksSynced(false);
@@ -358,65 +380,129 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     ]);
   }
 
-  async function scheduleReminder(task: Task) {
-    const startedAt = Date.now();
-    const deadline = getNextScheduledDeadline(task, startedAt);
-    const reminderAt = Math.max(startedAt + 1000, deadline - getReminderInterval(task, startedAt, deadline) * 0.2);
-    if (Platform.OS === 'web' || !Notifications) return { deadline };
+  async function ensureNotificationPermission() {
+    if (Platform.OS === 'web' || !Notifications) return false;
     const permissions = await Notifications.getPermissionsAsync();
-    const granted = permissions.granted || (await Notifications.requestPermissionsAsync()).granted;
-    if (!granted) return { deadline };
-    const notificationId = await Notifications.scheduleNotificationAsync({
-      content: {
-        title: 'Task reminder',
-        body: `20% of the scheduled time remains for "${task.title}".`,
-        data: { taskTitle: task.title },
-        sound: 'task_reminder.mp3',
-        vibrate: [0, 500, 250, 500, 250, 700],
-      },
-      trigger: {
-        type: Notifications.SchedulableTriggerInputTypes.DATE,
-        date: new Date(reminderAt),
-        channelId: 'task-reminders-custom',
-      },
+    return permissions.granted || (await Notifications.requestPermissionsAsync()).granted;
+  }
+
+  async function scheduleNotificationAt(at: number, title: string, body: string, taskId: string) {
+    if (!Notifications) return undefined;
+    return Notifications.scheduleNotificationAsync({
+      content: { title, body, data: { taskId }, sound: 'love_sms.mp3', vibrate: [0, 500, 250, 500, 250, 700] },
+      trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: new Date(at), channelId: 'task-alerts-love-sms' },
     });
-    return { deadline, notificationId };
   }
 
-  async function toggleReminder(task: Task) {
-    const selected = reminderTaskIds.includes(task.id);
-    if (selected) {
-      Alert.alert('Remove reminder?', `Are you sure you want to remove the reminder for "${task.title}"?`, [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Remove',
-          style: 'destructive',
-          onPress: async () => {
-            if (task.notificationId) await Notifications?.cancelScheduledNotificationAsync(task.notificationId);
-            setReminderTaskIds((current) => current.filter((id) => id !== task.id));
-            setTasks((current) => current.map((item) => item.id === task.id
-              ? { ...item, deadline: undefined, notificationId: undefined }
-              : item));
-          },
-        },
-      ]);
-      return;
+  // Schedules every reminder plus the "Deadline reached" alert for the task's next deadline.
+  async function scheduleTaskAlerts(task: Task) {
+    await cancelTaskAlerts(task, false);
+    const { deadline, notifications } = planTaskNotifications(task, Date.now(), defaultReminderPercent);
+    if (notifications.length === 0 || !(await ensureNotificationPermission())) return { scheduledFor: deadline, alertIds: [] };
+    const alertIds: string[] = [];
+    for (const item of notifications) {
+      const id = await scheduleNotificationAt(item.at, item.title, item.body, task.id);
+      if (id) alertIds.push(id);
     }
-
-    const reminder = await scheduleReminder(task);
-    setReminderTaskIds((current) => [...current, task.id]);
-    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, ...reminder } : item));
-    Alert.alert('Reminder set', `A reminder has been set for "${task.title}".`);
+    return { scheduledFor: deadline, alertIds };
   }
 
-  async function addTask() {
+  async function cancelTaskAlerts(task: Task, includeTimer = true) {
+    if (!Notifications) return;
+    // deadlineNotificationId: left over from the previous version of deadline alerts.
+    const legacyDeadlineId = (task as Task & { deadlineNotificationId?: string }).deadlineNotificationId;
+    const ids = [...(task.alertIds ?? []), task.notificationId, legacyDeadlineId, includeTimer ? task.timerNotificationId : undefined];
+    await Promise.all(ids.filter((id): id is string => !!id).map((id) => Notifications.cancelScheduledNotificationAsync(id).catch(() => undefined)));
+  }
+
+  // Clearing these makes the scheduler below plan the task's notifications again.
+  const clearedAlerts = { scheduledFor: undefined, alertIds: undefined, notificationId: undefined };
+
+
+  function resetTaskForm() {
+    setDraft('');
+    setDescriptionDraft('');
+    setDurationDraft('30');
+    setTimerEnabled(false);
+    setFrequency('Once');
+    setSelectedWeekdays([]);
+    setScheduledDate('');
+    setScheduledTime('');
+    setReminderChoice('auto');
+    setCustomReminderDraft('');
+    setTaskProject(defaultTaskProject);
+  }
+
+  function openTaskEditor(task: Task) {
+    const minutes = task.customReminderMinutes;
+    setDraft(task.title);
+    setDescriptionDraft(task.description);
+    setTaskProject(task.project === 'Work' ? 'Work' : 'Personal');
+    setTimerEnabled(task.allottedMinutes !== undefined);
+    setDurationDraft(String(task.allottedMinutes ?? 30));
+    setFrequency(task.frequency);
+    setSelectedWeekdays(task.weekdays ?? []);
+    setScheduledDate(task.scheduledDate ?? '');
+    setScheduledTime(task.scheduledTime ?? '');
+    setReminderChoice(task.frequentReminders ? 'every20' : minutes ? ([15, 60, 1440].includes(minutes) ? minutes : 'custom') : 'auto');
+    setCustomReminderDraft(minutes && ![15, 60, 1440].includes(minutes) ? String(minutes) : '');
+    setEditingTaskId(task.id);
+    setIsCreating(true);
+  }
+
+  function closeTaskEditor() {
+    setIsCreating(false);
+    if (editingTaskId) {
+      setEditingTaskId(null);
+      resetTaskForm();
+    }
+  }
+
+  function confirmRemoveTask(task: Task) {
+    Alert.alert('Delete task?', `"${task.title}" will be deleted.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: () => removeTask(task.id) },
+    ]);
+  }
+
+  async function saveTask() {
     const title = draft.trim();
     if (!title) return;
     const allottedMinutes = Math.max(1, Number.parseInt(durationDraft, 10) || 30);
     const timerData = timerEnabled ? { allottedMinutes } : {};
+    const customMinutes = reminderChoice === 'custom' ? Number.parseInt(customReminderDraft, 10) : reminderChoice;
+    const reminderData = reminderChoice === 'every20'
+      ? { frequentReminders: true }
+      : typeof customMinutes === 'number' && customMinutes > 0 ? { customReminderMinutes: customMinutes } : {};
+    const editedTask = editingTaskId ? tasks.find((task) => task.id === editingTaskId) : undefined;
+    if (editedTask) {
+      // Old reminders no longer match; the scheduler plans new ones from the updated details.
+      await cancelTaskAlerts(editedTask, false);
+      setTasks((current) => current.map((task) => task.id === editedTask.id ? {
+        ...task,
+        ...clearedAlerts,
+        title,
+        description: descriptionDraft.trim(),
+        project: taskProject,
+        frequency,
+        weekdays: frequency === 'Several times weekly' || frequency === 'Weekly' ? selectedWeekdays : undefined,
+        scheduledDate: frequency === 'Once' || frequency === 'Monthly' ? scheduledDate.trim() : undefined,
+        scheduledTime: scheduledTime.trim(),
+        deadline: undefined,
+        allottedMinutes: timerEnabled ? allottedMinutes : undefined,
+        frequentReminders: undefined,
+        customReminderMinutes: undefined,
+        ...reminderData,
+      } : task));
+      closeTaskEditor();
+      return;
+    }
+
+    const createdAt = Date.now();
     setTasks((current) => [
       {
-        id: Date.now().toString(),
+        id: createdAt.toString(),
+        createdAt,
         title,
         description: descriptionDraft.trim(),
         project: taskProject,
@@ -428,18 +514,11 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
         done: false,
         accent: '#000000',
         ...timerData,
+        ...reminderData,
       },
       ...current,
     ]);
-    setDraft('');
-    setDescriptionDraft('');
-    setDurationDraft('30');
-    setTimerEnabled(false);
-    setFrequency('Once');
-    setSelectedWeekdays([]);
-    setScheduledDate('');
-    setScheduledTime('');
-    setTaskProject(defaultTaskProject);
+    resetTaskForm();
     setIsCreating(false);
     setIsProfileOpen(false);
   }
@@ -448,56 +527,81 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     const task = tasks.find((item) => item.id === id);
     if (!task?.allottedMinutes || task.startedAt) return;
     const startedAt = Date.now();
-    const reminder = task.notificationId
-      ? { deadline: task.deadline }
-      : reminderTaskIds.includes(id)
-      ? await scheduleReminder(task)
-      : { deadline: getNextScheduledDeadline(task, startedAt) };
-    setTasks((current) => current.map((item) => item.id === id ? { ...item, startedAt, ...reminder } : item));
+    const timerEndsAt = startedAt + task.allottedMinutes * 60000;
+    const timerNotificationId = await ensureNotificationPermission()
+      ? await scheduleNotificationAt(timerEndsAt, "Time's up", `Your ${formatMinutes(task.allottedMinutes)} for "${task.title}" are up.`, task.id)
+      : undefined;
+    setTasks((current) => current.map((item) => item.id === id
+      ? { ...item, startedAt, timerEndsAt, timerNotificationId, deadline: getNextScheduledDeadline(task, startedAt) }
+      : item));
   }
 
   async function toggleTask(id: string) {
     const task = tasks.find((item) => item.id === id);
     if (!task) return;
-    if (task.notificationId) await Notifications?.cancelScheduledNotificationAsync(task.notificationId);
+    await cancelTaskAlerts(task);
+    const cleared = { ...clearedAlerts, deadline: undefined, timerEndsAt: undefined, timerNotificationId: undefined };
     if (task.done) {
-      setTasks((current) => current.map((item) => (item.id === id ? { ...item, done: false, deadline: undefined, notificationId: undefined, startedAt: undefined } : item)));
+      setTasks((current) => current.map((item) => (item.id === id ? { ...item, ...cleared, done: false, startedAt: undefined } : item)));
       return;
     }
-    setTasks((current) => current.map((item) => (item.id === id ? { ...item, done: true, deadline: undefined, notificationId: undefined } : item)));
+    setTasks((current) => current.map((item) => (item.id === id ? { ...item, ...cleared, done: true } : item)));
   }
 
   async function removeTask(id: string) {
     const task = tasks.find((item) => item.id === id);
-    if (task?.notificationId) await Notifications?.cancelScheduledNotificationAsync(task.notificationId);
+    if (task) await cancelTaskAlerts(task);
     setTasks((current) => current.filter((task) => task.id !== id));
-    setMenuTaskId(null);
+    setExpandedTaskId(null);
   }
 
   function refreshTask(id: string) {
+    const task = tasks.find((item) => item.id === id);
+    if (task) cancelTaskAlerts(task);
     setTasks((current) => current.map((item) => item.id === id
-      ? { ...item, done: false, deadline: undefined, notificationId: undefined, startedAt: undefined }
+      ? { ...item, ...clearedAlerts, done: false, deadline: undefined, startedAt: undefined, timerEndsAt: undefined, timerNotificationId: undefined }
       : item));
-    setMenuTaskId(null);
   }
+
+  // Keep reminders + a "Deadline reached" alert scheduled for every unfinished task; repeating tasks get the next set after each deadline.
+  const schedulingDeadlineIds = React.useRef(new Set<string>());
+  const minuteTick = Math.floor(now / 60000);
+  useEffect(() => {
+    if (!tasksSynced || !Notifications) return;
+    const currentTime = Date.now();
+    const due = tasks.filter((task) => !task.done
+      && !schedulingDeadlineIds.current.has(task.id)
+      && (task.scheduledFor === undefined || (task.scheduledFor <= currentTime && task.frequency !== 'Once')));
+    due.forEach(async (task) => {
+      schedulingDeadlineIds.current.add(task.id);
+      try {
+        const alert = await scheduleTaskAlerts(task);
+        setTasks((current) => current.map((item) => item.id === task.id ? { ...item, ...alert } : item));
+      } catch (error) {
+        console.warn('Could not schedule task notifications', error);
+      } finally {
+        schedulingDeadlineIds.current.delete(task.id);
+      }
+    });
+  }, [minuteTick, tasks, tasksSynced]);
 
   // Android back button/gesture: step back one screen instead of closing the app.
   useEffect(() => {
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (menuTaskId) setMenuTaskId(null);
-      else if (isFilterOpen) setIsFilterOpen(false);
+      if (isFilterOpen) setIsFilterOpen(false);
       else if (username === null || phoneNumber === null) {
         if (!onBack) return false;
         onBack();
       }
-      else if (isCreating) setIsCreating(false);
+      else if (isCreating) closeTaskEditor();
       else if (isReminderOpen) setIsReminderOpen(false);
       else if (isProfileOpen) setIsProfileOpen(false);
+      else if (expandedTaskId) setExpandedTaskId(null);
       else return false; // On the main task list, let Android close the app as usual.
       return true;
     });
     return () => subscription.remove();
-  }, [isCreating, isFilterOpen, isProfileOpen, isReminderOpen, menuTaskId, onBack, phoneNumber, username]);
+  }, [editingTaskId, expandedTaskId, isCreating, isFilterOpen, isProfileOpen, isReminderOpen, onBack, phoneNumber, username]);
 
   if (!profileLoaded) return null;
 
@@ -613,21 +717,29 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
             <Text style={styles.createHeaderTitle}>Reminders</Text>
             <View style={styles.headerSpacer} />
           </View>
-          <Text style={styles.createTitle}>Choose task reminders</Text>
-          <Text style={styles.createSubtitle}>Selected tasks notify you when 20% of the scheduled time remains.</Text>
           <FlatList
             data={pendingTasks}
             keyExtractor={(item) => `reminder-${item.id}`}
             showsVerticalScrollIndicator={false}
             contentContainerStyle={styles.list}
+            keyboardShouldPersistTaps="handled"
+            ListHeaderComponent={(
+              <View>
+                <Text style={styles.createTitle}>Reminders</Text>
+                <Text style={styles.createSubtitle}>Every reminder arrives as a notification and an alert. Choose a task's reminder under REMIND ME when you create it.</Text>
+              </View>
+            )}
             ListEmptyComponent={<View style={styles.empty}><Ionicons name="notifications-off-outline" size={30} color={colors.text} /><Text style={styles.emptyTitle}>No pending tasks</Text><Text style={styles.emptyText}>Completed and overdue tasks cannot receive reminders.</Text></View>}
             renderItem={({ item }) => {
-              const selected = reminderTaskIds.includes(item.id);
+              const reminderLabel = item.frequentReminders ? 'Every 20%' : item.customReminderMinutes ? `${formatMinutes(item.customReminderMinutes)} before` : `Auto (${defaultReminderPercent}% left)`;
               return (
-                <TouchableOpacity onPress={() => toggleReminder(item)} style={styles.reminderTaskRow}>
-                  <View style={styles.reminderTaskCopy}><Text style={styles.taskTitle}>{item.title}</Text><Text style={styles.profileTaskMeta}>{item.project}  •  {getScheduleLabel(item)}</Text></View>
-                  <View style={[styles.reminderCheck, selected && styles.reminderCheckActive]}>{selected && <Ionicons name="checkmark" size={14} color={colors.text} />}</View>
-                </TouchableOpacity>
+                <View style={styles.reminderTaskRow}>
+                  <View style={styles.reminderTaskCopy}><Text style={styles.taskTitle}>{item.title}</Text><Text style={styles.profileTaskMeta}>{getScheduleLabel(item)}</Text></View>
+                  <View style={styles.reminderBadge}>
+                    <Ionicons name="notifications-outline" size={13} color={colors.text} />
+                    <Text style={styles.reminderBadgeText}>{reminderLabel}</Text>
+                  </View>
+                </View>
               );
             }}
           />
@@ -642,10 +754,10 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
         <StatusBar style={colors.statusBar} />
         <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
           <View style={styles.createHeader}>
-            <TouchableOpacity onPress={() => setIsCreating(false)} accessibilityLabel="Go back" style={styles.backButton}>
+            <TouchableOpacity onPress={closeTaskEditor} accessibilityLabel="Go back" style={styles.backButton}>
               <Ionicons name="arrow-back" size={18} color={colors.text} />
             </TouchableOpacity>
-            <Text style={styles.createHeaderTitle}>New task</Text>
+            <Text style={styles.createHeaderTitle}>{editingTaskId ? 'Edit task' : 'New task'}</Text>
             <View style={styles.headerSpacer} />
           </View>
 
@@ -655,8 +767,8 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
-            <Text style={styles.createEyebrow}>ADD TO YOUR LIST</Text>
-            <Text style={styles.createTitle}>What needs doing?</Text>
+            <Text style={styles.createEyebrow}>{editingTaskId ? 'EDIT TASK' : 'ADD TO YOUR LIST'}</Text>
+            <Text style={styles.createTitle}>{editingTaskId ? 'Update this task' : 'What needs doing?'}</Text>
             <Text style={styles.createSubtitle}>Keep it simple. You can set a duration when this task needs one.</Text>
 
             <Text style={styles.fieldLabel}>TASK LIST</Text>
@@ -671,7 +783,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
 
             <Text style={styles.fieldLabel}>TASK NAME</Text>
             <TextInput
-              autoFocus
+              autoFocus={!editingTaskId}
               value={draft}
               onChangeText={setDraft}
               placeholder="e.g. Call the dentist"
@@ -781,8 +893,23 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
               </View>
             )}
 
-            <TouchableOpacity onPress={addTask} disabled={!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())} style={[styles.saveButton, (!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())) && styles.saveButtonDisabled]}>
-              <Text style={styles.saveButtonText}>Create task</Text>
+            <Text style={[styles.fieldLabel, styles.reminderSectionLabel]}>REMIND ME</Text>
+            <View style={styles.frequencyOptions}>
+              {([['auto', `Auto (${defaultReminderPercent}% left)`], ['every20', 'Every 20%'], [15, '15 min before'], [60, '1 hour before'], [1440, '1 day before'], ['custom', 'Custom']] as const).map(([value, label]) => (
+                <TouchableOpacity key={String(value)} onPress={() => setReminderChoice(value)} style={[styles.frequencyOption, reminderChoice === value && styles.frequencyOptionActive]}>
+                  <Text style={[styles.frequencyOptionText, reminderChoice === value && styles.frequencyOptionTextActive]}>{label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            {reminderChoice === 'custom' && (
+              <View style={[styles.durationRow, styles.customReminderRow]}>
+                <TextInput value={customReminderDraft} onChangeText={(text) => setCustomReminderDraft(text.replace(/[^0-9]/g, ''))} placeholder="30" placeholderTextColor="#9BA09A" keyboardType="number-pad" maxLength={5} accessibilityLabel="Minutes before the deadline" style={styles.durationLargeInput} />
+                <Text style={styles.durationUnit}>minutes before the deadline</Text>
+              </View>
+            )}
+
+            <TouchableOpacity onPress={saveTask} disabled={!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())} style={[styles.saveButton, (!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())) && styles.saveButtonDisabled]}>
+              <Text style={styles.saveButtonText}>{editingTaskId ? 'Save changes' : 'Create task'}</Text>
               <Ionicons name="arrow-forward" size={16} color={colors.text} />
             </TouchableOpacity>
           </ScrollView>
@@ -872,24 +999,30 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
                     <Text style={styles.descriptionText}>{item.description || 'No description added.'}</Text>
                     {item.allottedMinutes !== undefined && !item.done && <TouchableOpacity onPress={() => startTaskTimer(item.id)} disabled={item.startedAt !== undefined} style={[styles.startButton, item.startedAt !== undefined && styles.startButtonDisabled]}>
                       <Ionicons name={item.startedAt !== undefined ? 'time-outline' : 'play'} size={14} color={colors.text} />
-                      <Text style={styles.startButtonText}>{item.startedAt !== undefined ? `${Math.max(0, Math.ceil(((item.deadline ?? now) - now) / 60000))} min left` : 'Start task'}</Text>
+                      <Text style={styles.startButtonText}>{item.startedAt === undefined ? 'Start task' : now >= (item.timerEndsAt ?? item.deadline ?? now) ? "Time's up" : `${Math.ceil(((item.timerEndsAt ?? item.deadline ?? now) - now) / 60000)} min left`}</Text>
                     </TouchableOpacity>}
+                    <View style={styles.taskActions}>
+                      <TouchableOpacity onPress={() => openTaskEditor(item)} accessibilityLabel={`Edit ${item.title}`} style={styles.taskActionButton}>
+                        <Ionicons name="create-outline" size={15} color={colors.text} />
+                        <Text style={styles.taskActionText}>Edit</Text>
+                      </TouchableOpacity>
+                      {item.done && (
+                        <TouchableOpacity onPress={() => refreshTask(item.id)} accessibilityLabel={`Refresh ${item.title}`} style={styles.taskActionButton}>
+                          <Ionicons name="refresh-outline" size={15} color={colors.text} />
+                          <Text style={styles.taskActionText}>Refresh</Text>
+                        </TouchableOpacity>
+                      )}
+                      <TouchableOpacity onPress={() => confirmRemoveTask(item)} accessibilityLabel={`Delete ${item.title}`} style={[styles.taskActionButton, styles.taskDeleteButton]}>
+                        <Ionicons name="trash-outline" size={15} color="#E14F3D" />
+                        <Text style={styles.deleteMenuText}>Delete</Text>
+                      </TouchableOpacity>
+                    </View>
                   </View>}
                 </View>
-                <TouchableOpacity onPress={() => setMenuTaskId((current) => current === item.id ? null : item.id)} accessibilityLabel={`Task actions for ${item.title}`} style={styles.moreButton}>
-                  <Ionicons name="ellipsis-horizontal" size={17} color="#9BA09A" />
-                </TouchableOpacity>
+                <View style={styles.moreButton}>
+                  <Ionicons name={expandedTaskId === item.id ? 'chevron-up' : 'chevron-down'} size={17} color="#9BA09A" />
+                </View>
               </TouchableOpacity>
-              {menuTaskId === item.id && <View style={styles.taskMenu}>
-                  <TouchableOpacity onPress={() => removeTask(item.id)} style={styles.menuAction}>
-                    <Ionicons name="trash-outline" size={14} color="#E14F3D" />
-                    <Text style={styles.deleteMenuText}>Delete</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity onPress={() => refreshTask(item.id)} disabled={!item.done} style={[styles.menuAction, !item.done && styles.menuActionDisabled]}>
-                    <Ionicons name="refresh-outline" size={14} color={item.done ? '#3E5141' : '#B7BDB6'} />
-                    <Text style={[styles.menuText, !item.done && styles.menuTextDisabled]}>Refresh</Text>
-                  </TouchableOpacity>
-              </View>}
             </View>
           ))}
         </ScrollView>
@@ -1064,6 +1197,11 @@ function createStyles(c: Palette) {
   weekdayOptionActive: { backgroundColor: c.bg, borderColor: c.text },
   weekdayText: { color: c.text, fontSize: 11, fontWeight: '700' },
   weekdayTextActive: { color: c.text },
+  reminderBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, borderWidth: 1, borderColor: c.border, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 5, marginLeft: 10 },
+  reminderBadgeText: { color: c.text, fontSize: 11, fontWeight: '700' },
+  reminderHelp: { color: c.text, opacity: 0.65, fontSize: 13, lineHeight: 19, marginBottom: 12 },
+  reminderSectionLabel: { marginTop: 24 },
+  customReminderRow: { marginTop: 10 },
   oneTimeFields: { marginTop: 24, marginBottom: 22 },
   dateTimeRow: { flexDirection: 'row', gap: 10 },
   dateTimeInput: { flex: 1, backgroundColor: c.bg, borderRadius: 14, borderWidth: 1.5, borderColor: c.border, color: c.text, fontSize: 15, paddingHorizontal: 14, paddingVertical: 16 },
@@ -1115,6 +1253,10 @@ function createStyles(c: Palette) {
   meta: { color: c.text, fontSize: 12 },
   overdueMeta: { color: COLORS.danger, fontWeight: '800' },
   metaDivider: { color: c.border, fontSize: 12, marginHorizontal: 7 },
+  taskActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
+  taskActionButton: { flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: c.text, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8 },
+  taskDeleteButton: { borderColor: '#E14F3D' },
+  taskActionText: { color: c.text, fontSize: 13, fontWeight: '700' },
   moreButton: { paddingLeft: 10, paddingVertical: 7 },
   taskMenu: { width: '100%', backgroundColor: c.bg, borderRadius: 12, borderWidth: 1, borderColor: c.border, paddingVertical: 4, marginTop: -2, ...shadowSm },
   menuAction: { flexDirection: 'row', alignItems: 'center', gap: 9, paddingHorizontal: 14, paddingVertical: 11 },
