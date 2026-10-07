@@ -27,9 +27,6 @@ export default function LandingPage({ onGetStarted, onSignIn }: { onGetStarted: 
           <Text style={styles.primaryButtonText}>Get started free</Text>
           <Ionicons name="arrow-forward" size={16} color={colors.text} />
         </TouchableOpacity>
-        <TouchableOpacity onPress={onSignIn} style={styles.linkButton}>
-          <Text style={styles.linkText}>I already have an account</Text>
-        </TouchableOpacity>
       </ScrollView>
     </SafeAreaView>
   );

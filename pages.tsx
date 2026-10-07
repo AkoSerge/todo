@@ -22,6 +22,10 @@ export type Task = {
   // Notifications scheduled on this phone for the deadline at scheduledFor.
   scheduledFor?: number;
   alertIds?: string[];
+  // Bumped when the notification rules change, so already-scheduled tasks get re-planned once.
+  alertsVersion?: number;
+  // Notification channel the alerts were scheduled on (they move when the channel changes).
+  alertsChannel?: string;
   // Started duration timer: when it runs out and its "Time's up" notification.
   timerEndsAt?: number;
   timerNotificationId?: string;
@@ -51,28 +55,43 @@ export function getScheduleLabel(task: Task) {
   return `${repeat} at ${task.scheduledTime ?? 'Time not set'}`;
 }
 
-export function isTaskFailed(task: Task, currentTime: number) {
-  if (task.done) return false;
-  if (task.deadline !== undefined) return currentTime >= task.deadline;
+// A task that isn't completed within this long after its deadline is marked as failed.
+export const FAIL_GRACE_MS = 10 * 60 * 1000;
+
+// The deadline that currently applies to the task (today's, for repeating tasks), if any.
+export function getCurrentDueTime(task: Task, currentTime: number) {
+  if (task.deadline !== undefined) return task.deadline;
   const timeMatch = task.scheduledTime?.match(/^(\d{1,2}):(\d{2})$/);
-  if (!timeMatch) return false;
+  if (!timeMatch) return undefined;
   const hours = Number(timeMatch[1]);
   const minutes = Number(timeMatch[2]);
-  if (hours > 23 || minutes > 59) return false;
+  if (hours > 23 || minutes > 59) return undefined;
   const current = new Date(currentTime);
   if (task.frequency === 'Once') {
     const dateMatch = task.scheduledDate?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (!dateMatch) return false;
-    const scheduled = new Date(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3]), hours, minutes);
-    return currentTime >= scheduled.getTime();
+    if (!dateMatch) return undefined;
+    return new Date(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3]), hours, minutes).getTime();
   }
-  if (task.frequency === 'Monthly' && Number(task.scheduledDate) !== current.getDate()) return false;
+  if (task.frequency === 'Monthly' && Number(task.scheduledDate) !== current.getDate()) return undefined;
   if ((task.frequency === 'Weekly' || task.frequency === 'Several times weekly') && task.weekdays?.length) {
     const dayNames: Weekday[] = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    if (!task.weekdays.includes(dayNames[current.getDay()])) return false;
+    if (!task.weekdays.includes(dayNames[current.getDay()])) return undefined;
   }
-  const scheduledToday = new Date(current.getFullYear(), current.getMonth(), current.getDate(), hours, minutes);
-  return currentTime >= scheduledToday.getTime();
+  return new Date(current.getFullYear(), current.getMonth(), current.getDate(), hours, minutes).getTime();
+}
+
+export function isTaskFailed(task: Task, currentTime: number) {
+  if (task.done) return false;
+  const due = getCurrentDueTime(task, currentTime);
+  return due !== undefined && currentTime >= due + FAIL_GRACE_MS;
+}
+
+// Past the deadline but still inside the grace period: milliseconds left to complete it, else undefined.
+export function getOverdueGraceLeft(task: Task, currentTime: number) {
+  if (task.done) return undefined;
+  const due = getCurrentDueTime(task, currentTime);
+  if (due === undefined || currentTime < due || currentTime >= due + FAIL_GRACE_MS) return undefined;
+  return due + FAIL_GRACE_MS - currentTime;
 }
 
 export function getNextScheduledDeadline(task: Task, timestamp: number) {

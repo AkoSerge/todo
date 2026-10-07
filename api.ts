@@ -1,7 +1,13 @@
+import Constants from 'expo-constants';
 import type { Task } from './pages';
 
-// Set in .env (EXPO_PUBLIC_API_URL).
-const API_URL: string | undefined = process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, '') || undefined;
+// While developing, the backend runs on the same PC as the dev server, so use that PC's current
+// address (port 4000). This keeps working when the PC's Wi-Fi IP changes.
+// For a release build, set EXPO_PUBLIC_API_URL in .env to the deployed server's address.
+const devServerHost = __DEV__ ? Constants.expoConfig?.hostUri?.split(':')[0] : undefined;
+const API_URL: string | undefined = devServerHost
+  ? `http://${devServerHost}:4000`
+  : process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, '') || undefined;
 
 export type SessionMode = 'create' | 'signin' | 'upsert';
 
@@ -21,7 +27,8 @@ export const googleUserId = (googleId: string) => `google:${googleId}`;
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!API_URL) throw new Error('The server address is not set. Add EXPO_PUBLIC_API_URL to the .env file.');
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  // Generous: a free hosted server can take up to ~50 s to wake up after being idle.
+  const timeout = setTimeout(() => controller.abort(), 60000);
   try {
     const response = await fetch(`${API_URL}${path}`, {
       ...init,

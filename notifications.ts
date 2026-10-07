@@ -1,7 +1,9 @@
-import { getNextScheduledDeadline, getReminderInterval, type Task } from './pages';
+import { FAIL_GRACE_MS, getNextScheduledDeadline, getReminderInterval, type Task } from './pages';
 
 export const DEFAULT_REMINDER_PERCENT = 20;
 export const FREQUENT_REMINDER_STEP = 20;
+// Increase when the notification rules change so existing tasks are rescheduled.
+export const ALERTS_VERSION = 5;
 
 export type PlannedNotification = { at: number; title: string; body: string };
 
@@ -51,5 +53,6 @@ export function planTaskNotifications(task: Task, now: number, defaultPercent: n
   }
 
   planned.push({ at: deadline, title: 'Deadline reached', body: `"${task.title}" is due now.` });
+  planned.push({ at: deadline + FAIL_GRACE_MS, title: 'Task failed', body: `"${task.title}" wasn't completed in time and is marked as failed.` });
   return { deadline, notifications: planned.filter((item) => item.at > now) };
 }

@@ -1,0 +1,19 @@
+# Render Blueprint for the Todo backend (server/).
+# Render > New > Blueprint > pick this GitHub repo. When asked, paste the Atlas connection string
+# (the MONGODB_URI line from server/.env) as the MONGODB_URI value.
+services:
+  - type: web
+    name: todo-api
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: todo
+      - key: NODE_VERSION
+        value: "22"

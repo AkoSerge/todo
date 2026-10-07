@@ -8,12 +8,14 @@ import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   AppState,
   BackHandler,
   Animated,
   FlatList,
   KeyboardAvoidingView,
+  Linking,
   PanResponder,
   Platform,
   ScrollView,
@@ -28,7 +30,9 @@ import {
   getNextScheduledDeadline,
   getReminderInterval,
   getScheduleLabel,
+  getOverdueGraceLeft,
   isTaskFailed,
+  FAIL_GRACE_MS,
   type AuthMode,
   type Frequency,
   type ProfileFilter,
@@ -41,8 +45,9 @@ import {
 } from './pages';
 import LandingPage from './landing';
 import { Palette, ThemeProvider, useTheme } from './theme';
+import { ToastProvider, useToast } from './toast';
 import { googleUserId, localUserId, openSession, saveTasks, type SessionMode, type UserRecord } from './api';
-import { DEFAULT_REMINDER_PERCENT, formatMinutes, planTaskNotifications } from './notifications';
+import { ALERTS_VERSION, DEFAULT_REMINDER_PERCENT, formatMinutes, planTaskNotifications } from './notifications';
 
 const Notifications: typeof NotificationsModule | null = Constants.appOwnership === 'expo'
   ? null
@@ -61,6 +66,50 @@ const DateTimePicker: typeof DateTimePickerModule | null = (() => {
 })();
 
 const pad = (value: number) => String(value).padStart(2, '0');
+
+// Android channels for task alerts. They ring like an alarm: played on the alarm stream (alarm volume,
+// heard even when the phone is on silent/vibrate) and allowed to break through Do Not Disturb once the
+// user enables "Override Do Not Disturb". The user can change the sound from Profile > Alarm sound.
+// - ALERT: the app's 5-second alarm tone (assets/alert_tone.mp3), used once the installed build contains it.
+// - DEVICE: the phone's default sound on the alarm stream, used by older builds without the tone.
+const ALERT_CHANNEL_ID = 'task-alarms-alert-tone';
+const DEVICE_CHANNEL_ID = 'task-alarms-default-sound';
+// Earlier channels (notification-style sounds); removed so only the alarm channel shows in settings.
+const OLD_CHANNEL_IDS = ['task-reminders-custom', 'task-alerts-love-sms', 'task-alerts-sms-tone', 'task-alerts', 'task-alerts-alert-tone', 'task-alerts-device-sound'];
+const ALERT_TONE = 'alert_tone.mp3';
+
+// Android fixes a channel's sound when it's created, and a missing sound file would make the channel
+// silent forever. So the alert channel is only created after a throwaway probe channel proves the
+// tone is in the installed app; otherwise the default-sound channel is used.
+async function setUpNotificationChannel(notifications: typeof NotificationsModule) {
+  const channelOptions = {
+    name: 'Task alarms',
+    description: 'Reminders, deadlines and "Time\'s up" alerts for your tasks',
+    importance: notifications.AndroidImportance.MAX,
+    bypassDnd: true,
+    lockscreenVisibility: notifications.AndroidNotificationVisibility.PUBLIC,
+    enableVibrate: true,
+    vibrationPattern: [0, 800, 400, 800, 400, 800, 400, 800, 400, 800],
+    audioAttributes: {
+      usage: notifications.AndroidAudioUsage.ALARM,
+      contentType: notifications.AndroidAudioContentType.SONIFICATION,
+      flags: { enforceAudibility: true, requestHardwareAudioVideoSynchronization: false },
+    },
+  };
+  const existing = await notifications.getNotificationChannelAsync(ALERT_CHANNEL_ID);
+  if (existing?.sound) return ALERT_CHANNEL_ID;
+
+  const probeId = `alert-tone-probe-${Date.now()}`;
+  await notifications.setNotificationChannelAsync(probeId, { ...channelOptions, sound: ALERT_TONE });
+  const probe = await notifications.getNotificationChannelAsync(probeId);
+  await notifications.deleteNotificationChannelAsync(probeId);
+  if (probe?.sound) {
+    await notifications.setNotificationChannelAsync(ALERT_CHANNEL_ID, { ...channelOptions, sound: ALERT_TONE });
+    return ALERT_CHANNEL_ID;
+  }
+  await notifications.setNotificationChannelAsync(DEVICE_CHANNEL_ID, channelOptions);
+  return DEVICE_CHANNEL_ID;
+}
 
 const GoogleAuth: typeof GoogleSignInModule | null = Constants.appOwnership === 'expo' || Platform.OS === 'web'
   ? null
@@ -101,11 +150,11 @@ class CrashBoundary extends React.Component<React.PropsWithChildren, CrashState>
   render() {
     if (this.state.error) {
       return (
-        <View style={crashStyles.crashScreen}>
+        <SafeAreaView style={crashStyles.crashScreen}>
           <Text style={crashStyles.crashTitle}>Todo crashed</Text>
           <Text style={crashStyles.crashMessage}>{this.state.error.message || 'Unknown JavaScript error'}</Text>
           <Text selectable style={crashStyles.crashLog}>{this.state.stack ?? this.state.error.toString()}</Text>
-        </View>
+        </SafeAreaView>
       );
     }
     return this.props.children;
@@ -114,6 +163,8 @@ class CrashBoundary extends React.Component<React.PropsWithChildren, CrashState>
 
 function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; onBack?: () => void }) {
   const { colors, mode, toggleTheme } = useTheme();
+  const showToast = useToast();
+  const [channelId, setChannelId] = useState<string | null>(Platform.OS === 'android' ? null : DEVICE_CHANNEL_ID);
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
@@ -139,6 +190,8 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
   const [scheduledTime, setScheduledTime] = useState('');
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  // Set when a failed task is being rescheduled from the Profile screen; the editor returns there.
+  const [isReschedulingFailed, setIsReschedulingFailed] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [isReminderOpen, setIsReminderOpen] = useState(false);
@@ -194,15 +247,15 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     Notifications.setNotificationHandler({
       handleNotification: async () => ({ shouldPlaySound: true, shouldSetBadge: false, shouldShowBanner: true, shouldShowList: true }),
     });
-    // Android fixes a channel's sound when it is created, so a new sound needs a new channel id.
-    Notifications.deleteNotificationChannelAsync('task-reminders-custom').catch(() => undefined);
-    Notifications.setNotificationChannelAsync('task-alerts-love-sms', {
-      name: 'Task reminders',
-      importance: Notifications.AndroidImportance.HIGH,
-      sound: 'love_sms.mp3',
-      vibrationPattern: [0, 500, 250, 500, 250, 700],
-      enableVibrate: true,
-    });
+    for (const oldChannel of OLD_CHANNEL_IDS) Notifications.deleteNotificationChannelAsync(oldChannel).catch(() => undefined);
+    if (Platform.OS === 'android') {
+      setUpNotificationChannel(Notifications)
+        .then(setChannelId)
+        .catch((error) => {
+          console.warn('Could not set up the alert tone channel', error);
+          setChannelId(DEVICE_CHANNEL_ID);
+        });
+    }
 
     // Every reminder also shows an alert: when it arrives while the app is open, or when it is tapped.
     const alerted = new Set<string>();
@@ -233,9 +286,12 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     return () => subscription.remove();
   }, []);
 
+  // Failed tasks (not completed within 10 minutes of the deadline) leave the task list; they stay under Profile > Failed.
   const visibleTasks = useMemo(() => tasks.filter((task) =>
-    task.done === (statusTab === 'completed') && (projectFilter === 'All' || task.project === projectFilter),
-  ), [projectFilter, statusTab, tasks]);
+    task.done === (statusTab === 'completed')
+    && !isTaskFailed(task, now)
+    && (projectFilter === 'All' || task.project === projectFilter),
+  ), [now, projectFilter, statusTab, tasks]);
   const defaultTaskProject: Project = projectFilter === 'All' ? 'Personal' : projectFilter;
   const [iosPicker, setIosPicker] = useState<'date' | 'time' | null>(null);
 
@@ -272,9 +328,8 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
         mode: kind,
         is24Hour: true,
         minimumDate: kind === 'date' && frequency === 'Once' ? today : undefined,
-        onChange: (event, picked) => {
-          if (event.type === 'set' && picked) applyPicked(kind, picked);
-        },
+        // Called only when a value is picked; cancelling just closes the dialog.
+        onValueChange: (_event, picked) => applyPicked(kind, picked),
       });
     } catch {
       Alert.alert('Update needed', 'The date picker needs the latest version of the app. Please install the new build.');
@@ -373,6 +428,19 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     setIsProfileOpen(false);
   }
 
+  async function openNotificationSoundSettings() {
+    const packageName = Constants.expoConfig?.android?.package ?? 'com.lumero4.taskflow';
+    try {
+      await Linking.sendIntent('android.settings.CHANNEL_NOTIFICATION_SETTINGS', [
+        { key: 'android.provider.extra.APP_PACKAGE', value: packageName },
+        { key: 'android.provider.extra.CHANNEL_ID', value: channelId ?? DEVICE_CHANNEL_ID },
+      ]);
+    } catch {
+      // Older or customised Android versions: fall back to the app's settings page.
+      Linking.openSettings().catch(() => Alert.alert('Could not open settings', 'Open Settings > Apps > Todo > Notifications to change the sound.'));
+    }
+  }
+
   function confirmLogout() {
     Alert.alert('Log out?', 'Are you sure you want to log out of your current account?', [
       { text: 'Cancel', style: 'cancel' },
@@ -389,22 +457,22 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
   async function scheduleNotificationAt(at: number, title: string, body: string, taskId: string) {
     if (!Notifications) return undefined;
     return Notifications.scheduleNotificationAsync({
-      content: { title, body, data: { taskId }, sound: 'love_sms.mp3', vibrate: [0, 500, 250, 500, 250, 700] },
-      trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: new Date(at), channelId: 'task-alerts-love-sms' },
+      content: { title, body, data: { taskId }, sound: true, priority: Notifications.AndroidNotificationPriority.MAX, vibrate: [0, 800, 400, 800, 400, 800, 400, 800, 400, 800] },
+      trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: new Date(at), channelId: channelId ?? DEVICE_CHANNEL_ID },
     });
   }
 
   // Schedules every reminder plus the "Deadline reached" alert for the task's next deadline.
   async function scheduleTaskAlerts(task: Task) {
-    await cancelTaskAlerts(task, false);
+    cancelTaskAlerts(task, false).catch(() => undefined);
     const { deadline, notifications } = planTaskNotifications(task, Date.now(), defaultReminderPercent);
-    if (notifications.length === 0 || !(await ensureNotificationPermission())) return { scheduledFor: deadline, alertIds: [] };
+    if (notifications.length === 0 || !(await ensureNotificationPermission())) return { scheduledFor: deadline, alertIds: [], alertsVersion: ALERTS_VERSION, alertsChannel: channelId ?? undefined };
     const alertIds: string[] = [];
     for (const item of notifications) {
       const id = await scheduleNotificationAt(item.at, item.title, item.body, task.id);
       if (id) alertIds.push(id);
     }
-    return { scheduledFor: deadline, alertIds };
+    return { scheduledFor: deadline, alertIds, alertsVersion: ALERTS_VERSION, alertsChannel: channelId ?? undefined };
   }
 
   async function cancelTaskAlerts(task: Task, includeTimer = true) {
@@ -456,6 +524,17 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
       setEditingTaskId(null);
       resetTaskForm();
     }
+    if (isReschedulingFailed) {
+      setIsReschedulingFailed(false);
+      setIsProfileOpen(true);
+    }
+  }
+
+  // A failed task's deadline has passed, so refreshing it means picking a new one.
+  function rescheduleFailedTask(task: Task) {
+    setIsReschedulingFailed(true);
+    setIsProfileOpen(false);
+    openTaskEditor(task);
   }
 
   function confirmRemoveTask(task: Task) {
@@ -468,6 +547,10 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
   async function saveTask() {
     const title = draft.trim();
     if (!title) return;
+    if (frequency === 'Once' && getNextScheduledDeadline({ frequency, scheduledDate: scheduledDate.trim(), scheduledTime: scheduledTime.trim() } as Task, Date.now()) <= Date.now()) {
+      Alert.alert('Pick a future time', 'The deadline has already passed. Choose a date and time that is still to come.');
+      return;
+    }
     const allottedMinutes = Math.max(1, Number.parseInt(durationDraft, 10) || 30);
     const timerData = timerEnabled ? { allottedMinutes } : {};
     const customMinutes = reminderChoice === 'custom' ? Number.parseInt(customReminderDraft, 10) : reminderChoice;
@@ -476,8 +559,9 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
       : typeof customMinutes === 'number' && customMinutes > 0 ? { customReminderMinutes: customMinutes } : {};
     const editedTask = editingTaskId ? tasks.find((task) => task.id === editingTaskId) : undefined;
     if (editedTask) {
-      // Old reminders no longer match; the scheduler plans new ones from the updated details.
-      await cancelTaskAlerts(editedTask, false);
+      // Old reminders no longer match; cancel them in the background (never block saving on the
+      // notification system) and let the scheduler plan new ones from the updated details.
+      cancelTaskAlerts(editedTask, false).catch((error) => console.warn('Could not cancel old reminders', error));
       setTasks((current) => current.map((task) => task.id === editedTask.id ? {
         ...task,
         ...clearedAlerts,
@@ -495,6 +579,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
         ...reminderData,
       } : task));
       closeTaskEditor();
+      showToast(`Changes saved to "${title}"`);
       return;
     }
 
@@ -520,6 +605,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     ]);
     resetTaskForm();
     setIsCreating(false);
+    showToast(`Task "${title}" created`);
     setIsProfileOpen(false);
   }
 
@@ -534,44 +620,52 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
     setTasks((current) => current.map((item) => item.id === id
       ? { ...item, startedAt, timerEndsAt, timerNotificationId, deadline: getNextScheduledDeadline(task, startedAt) }
       : item));
+    showToast(`Timer started: ${formatMinutes(task.allottedMinutes)}`, 'timer-outline');
   }
 
   async function toggleTask(id: string) {
     const task = tasks.find((item) => item.id === id);
     if (!task) return;
-    await cancelTaskAlerts(task);
+    cancelTaskAlerts(task).catch(() => undefined);
     const cleared = { ...clearedAlerts, deadline: undefined, timerEndsAt: undefined, timerNotificationId: undefined };
     if (task.done) {
       setTasks((current) => current.map((item) => (item.id === id ? { ...item, ...cleared, done: false, startedAt: undefined } : item)));
+      showToast(`"${task.title}" moved back to ongoing`, 'arrow-undo-outline');
       return;
     }
     setTasks((current) => current.map((item) => (item.id === id ? { ...item, ...cleared, done: true } : item)));
+    showToast(`"${task.title}" completed`);
   }
 
   async function removeTask(id: string) {
     const task = tasks.find((item) => item.id === id);
-    if (task) await cancelTaskAlerts(task);
+    if (task) cancelTaskAlerts(task).catch(() => undefined);
     setTasks((current) => current.filter((task) => task.id !== id));
     setExpandedTaskId(null);
+    if (task) showToast(`"${task.title}" deleted`, 'trash-outline');
   }
 
   function refreshTask(id: string) {
     const task = tasks.find((item) => item.id === id);
-    if (task) cancelTaskAlerts(task);
+    if (task) cancelTaskAlerts(task).catch(() => undefined);
     setTasks((current) => current.map((item) => item.id === id
       ? { ...item, ...clearedAlerts, done: false, deadline: undefined, startedAt: undefined, timerEndsAt: undefined, timerNotificationId: undefined }
       : item));
+    if (task) showToast(`"${task.title}" is active again`, 'refresh-outline');
   }
 
   // Keep reminders + a "Deadline reached" alert scheduled for every unfinished task; repeating tasks get the next set after each deadline.
   const schedulingDeadlineIds = React.useRef(new Set<string>());
   const minuteTick = Math.floor(now / 60000);
   useEffect(() => {
-    if (!tasksSynced || !Notifications) return;
+    if (!tasksSynced || !Notifications || !channelId) return;
     const currentTime = Date.now();
     const due = tasks.filter((task) => !task.done
       && !schedulingDeadlineIds.current.has(task.id)
-      && (task.scheduledFor === undefined || (task.scheduledFor <= currentTime && task.frequency !== 'Once')));
+      && (task.scheduledFor === undefined
+        || task.alertsVersion !== ALERTS_VERSION
+        || task.alertsChannel !== channelId
+        || (task.scheduledFor + FAIL_GRACE_MS <= currentTime && task.frequency !== 'Once')));
     due.forEach(async (task) => {
       schedulingDeadlineIds.current.add(task.id);
       try {
@@ -583,7 +677,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
         schedulingDeadlineIds.current.delete(task.id);
       }
     });
-  }, [minuteTick, tasks, tasksSynced]);
+  }, [channelId, minuteTick, tasks, tasksSynced]);
 
   // Android back button/gesture: step back one screen instead of closing the app.
   useEffect(() => {
@@ -601,16 +695,29 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
       return true;
     });
     return () => subscription.remove();
-  }, [editingTaskId, expandedTaskId, isCreating, isFilterOpen, isProfileOpen, isReminderOpen, onBack, phoneNumber, username]);
+  }, [editingTaskId, expandedTaskId, isCreating, isReschedulingFailed, isFilterOpen, isProfileOpen, isReminderOpen, onBack, phoneNumber, username]);
 
-  if (!profileLoaded) return null;
+  // Shown briefly while the saved account and its tasks load.
+  if (!profileLoaded) {
+    return (
+      <SafeAreaView style={[styles.safeArea, styles.loadingScreen]}>
+        <StatusBar style={colors.statusBar} />
+        <ActivityIndicator size="large" color={colors.text} />
+      </SafeAreaView>
+    );
+  }
 
   if (username === null || phoneNumber === null) {
     return (
       <SafeAreaView style={styles.safeArea}>
         <StatusBar style={colors.statusBar} />
-        <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-          <View style={styles.profilePage}>
+        {/* padding (not height) so the keyboard only adds space at the bottom and never pushes the form under the status bar */}
+        <KeyboardAvoidingView style={styles.container} behavior="padding">
+          <ScrollView
+            contentContainerStyle={styles.profilePage}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
             {onBack && (
               <TouchableOpacity onPress={onBack} accessibilityLabel="Go back" style={[styles.backButton, { marginBottom: 18 }]}>
                 <Ionicons name="arrow-back" size={18} color={colors.text} />
@@ -642,7 +749,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
               <Ionicons name="logo-google" size={16} color={colors.text} />
               <Text style={styles.googleButtonText}>{authMode === 'create' ? 'Sign up with Google' : 'Continue with Google'}</Text>
             </TouchableOpacity>
-          </View>
+          </ScrollView>
         </KeyboardAvoidingView>
       </SafeAreaView>
     );
@@ -675,12 +782,19 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
             ListEmptyComponent={<View style={styles.empty}><Ionicons name="checkmark-circle-outline" size={30} color={colors.text} /><Text style={styles.emptyTitle}>No {profileFilter.toLowerCase()} tasks</Text></View>}
             renderItem={({ item }) => (
               <View style={[styles.profileTaskRow, item.done && styles.completedCard]}>
-                <View style={styles.profileTaskBody}><Text style={[styles.taskTitle, item.done && styles.completedText]}>{item.title}</Text><Text style={styles.profileTaskMeta}>{item.project}  •  {getScheduleLabel(item)}</Text></View>
-                <Ionicons name={item.done ? 'checkmark-circle' : isTaskFailed(item, now) ? 'alert-circle' : 'ellipse-outline'} size={17} color={item.done ? '#8B9A6B' : isTaskFailed(item, now) ? '#D85C43' : '#B7BDB6'} />
+                <View style={styles.profileTaskBody}><Text style={[styles.taskTitle, item.done && styles.completedText]}>{item.title}</Text><Text style={styles.profileTaskMeta}>{item.project}  •  {getScheduleLabel(item)}</Text>{isTaskFailed(item, now) && <View style={styles.failedBadge}><Ionicons name="alert-circle" size={13} color="#D85C43" /><Text style={styles.failedBadgeText}>Failed</Text></View>}</View>
+                {isTaskFailed(item, now) ? (
+                  <TouchableOpacity onPress={() => rescheduleFailedTask(item)} accessibilityLabel={`Refresh ${item.title} with a new deadline`} style={styles.taskActionButton}>
+                    <Ionicons name="refresh-outline" size={15} color={colors.text} />
+                    <Text style={styles.taskActionText}>Refresh</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <Ionicons name={item.done ? 'checkmark-circle' : 'ellipse-outline'} size={17} color={item.done ? '#8B9A6B' : '#B7BDB6'} />
+                )}
               </View>
             )}
           />
-          <View style={[styles.timerSetting, styles.themeSetting]}>
+          <View style={[styles.timerSetting, styles.themeSetting, Platform.OS === 'android' && styles.settingStacked]}>
             <View style={styles.timerCopy}>
               <Ionicons name={mode === 'dark' ? 'moon' : 'moon-outline'} size={19} color={colors.text} />
               <Text style={styles.timerTitle}>Dark mode</Text>
@@ -695,6 +809,18 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
               <View style={[styles.toggleKnob, mode === 'dark' && styles.toggleKnobActive]} />
             </TouchableOpacity>
           </View>
+          {Platform.OS === 'android' && (
+            <TouchableOpacity onPress={openNotificationSoundSettings} accessibilityRole="button" accessibilityLabel="Alarm sound settings" style={[styles.timerSetting, styles.soundSetting]}>
+              <View style={styles.timerCopy}>
+                <Ionicons name="musical-notes-outline" size={19} color={colors.text} />
+                <View>
+                  <Text style={styles.timerTitle}>Alarm sound</Text>
+                  <Text style={styles.timerSubtitle}>Change the sound, or let alarms ring in Do Not Disturb</Text>
+                </View>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={colors.text} />
+            </TouchableOpacity>
+          )}
           <TouchableOpacity onPress={confirmLogout} style={styles.logoutButton}>
             <Ionicons name="log-out-outline" size={16} color={COLORS.danger} />
             <Text style={styles.logoutText}>Log out</Text>
@@ -767,8 +893,8 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
-            <Text style={styles.createEyebrow}>{editingTaskId ? 'EDIT TASK' : 'ADD TO YOUR LIST'}</Text>
-            <Text style={styles.createTitle}>{editingTaskId ? 'Update this task' : 'What needs doing?'}</Text>
+            <Text style={styles.createEyebrow}>{isReschedulingFailed ? 'REFRESH FAILED TASK' : editingTaskId ? 'EDIT TASK' : 'ADD TO YOUR LIST'}</Text>
+            <Text style={styles.createTitle}>{isReschedulingFailed ? 'Pick a new deadline' : editingTaskId ? 'Update this task' : 'Make it happen'}</Text>
             <Text style={styles.createSubtitle}>Keep it simple. You can set a duration when this task needs one.</Text>
 
             <Text style={styles.fieldLabel}>TASK LIST</Text>
@@ -859,7 +985,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
                     display="spinner"
                     themeVariant={mode}
                     minimumDate={iosPicker === 'date' && frequency === 'Once' ? new Date(new Date().setHours(0, 0, 0, 0)) : undefined}
-                    onChange={(_event, picked) => { if (picked) applyPicked(iosPicker, picked); }}
+                    onValueChange={(_event, picked) => applyPicked(iosPicker, picked)}
                   />
                 )}
               </View>
@@ -908,7 +1034,7 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
               </View>
             )}
 
-            <TouchableOpacity onPress={saveTask} disabled={!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())} style={[styles.saveButton, (!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())) && styles.saveButtonDisabled]}>
+            <TouchableOpacity onPress={() => saveTask().catch((error) => Alert.alert('Could not save task', error instanceof Error ? error.message : 'Please try again.'))} disabled={!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())} style={[styles.saveButton, (!draft.trim() || !scheduledTime.trim() || ((frequency === 'Weekly' || frequency === 'Several times weekly') && selectedWeekdays.length === 0) || ((frequency === 'Once' || frequency === 'Monthly') && !scheduledDate.trim())) && styles.saveButtonDisabled]}>
               <Text style={styles.saveButtonText}>{editingTaskId ? 'Save changes' : 'Create task'}</Text>
               <Ionicons name="arrow-forward" size={16} color={colors.text} />
             </TouchableOpacity>
@@ -994,7 +1120,10 @@ function TaskflowApp({ initialAuthMode, onBack }: { initialAuthMode: AuthMode; o
                 </TouchableOpacity>
                 <View style={styles.taskBody}>
                   <Text style={[styles.taskTitle, styles.taskCardTitle, item.done && styles.completedText]}>{item.title}</Text>
-                  <View style={styles.metaRow}><Text style={[styles.meta, styles.taskCardMeta]}>{item.project}</Text><Text style={[styles.metaDivider, styles.taskCardMeta]}>•</Text><Text style={[styles.meta, styles.taskCardMeta]}>{getScheduleLabel(item)}</Text>{item.allottedMinutes !== undefined && <><Text style={[styles.metaDivider, styles.taskCardMeta]}>•</Text><Text style={[styles.meta, styles.taskCardMeta, item.deadline !== undefined && now >= item.deadline && !item.done ? styles.overdueMeta : undefined]}>{item.deadline !== undefined && now >= item.deadline && !item.done ? 'Overdue' : `${item.allottedMinutes} min`}</Text></>}</View>
+                  <View style={styles.metaRow}><Text style={[styles.meta, styles.taskCardMeta]}>{item.project}</Text><Text style={[styles.metaDivider, styles.taskCardMeta]}>•</Text><Text style={[styles.meta, styles.taskCardMeta]}>{getScheduleLabel(item)}</Text>{item.allottedMinutes !== undefined && <><Text style={[styles.metaDivider, styles.taskCardMeta]}>•</Text><Text style={[styles.meta, styles.taskCardMeta]}>{`${item.allottedMinutes} min`}</Text></>}</View>
+                  {getOverdueGraceLeft(item, now) !== undefined && (
+                    <Text style={[styles.meta, styles.overdueMeta, styles.statusMeta]}>Overdue</Text>
+                  )}
                   {expandedTaskId === item.id && <View style={styles.taskDetails}>
                     <Text style={styles.descriptionText}>{item.description || 'No description added.'}</Text>
                     {item.allottedMinutes !== undefined && !item.done && <TouchableOpacity onPress={() => startTaskTimer(item.id)} disabled={item.startedAt !== undefined} style={[styles.startButton, item.startedAt !== undefined && styles.startButtonDisabled]}>
@@ -1042,9 +1171,11 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <ThemeProvider>
-        <CrashBoundary>
-          <AppContent />
-        </CrashBoundary>
+        <ToastProvider>
+          <CrashBoundary>
+            <AppContent />
+          </CrashBoundary>
+        </ToastProvider>
       </ThemeProvider>
     </SafeAreaProvider>
   );
@@ -1092,7 +1223,7 @@ const shadowMd = {
 };
 
 const crashStyles = StyleSheet.create({
-  crashScreen: { flex: 1, backgroundColor: '#1A0E0C', padding: 24, paddingTop: 72 },
+  crashScreen: { flex: 1, backgroundColor: '#1A0E0C', padding: 24 },
   crashTitle: { color: '#FF9A8A', fontSize: 28, fontWeight: '800', marginBottom: 12 },
   crashMessage: { color: '#FFFFFF', fontSize: 17, marginBottom: 24 },
   crashLog: { color: '#FFC9BE', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 12, lineHeight: 18 },
@@ -1100,11 +1231,13 @@ const crashStyles = StyleSheet.create({
 
 function createStyles(c: Palette) {
   return StyleSheet.create({
+  loadingScreen: { justifyContent: 'center', alignItems: 'center' },
   safeArea: { flex: 1, backgroundColor: c.bg },
   container: { flex: 1, paddingHorizontal: 22 },
   dashboardScroll: { flex: 1 },
   dashboardContent: { flexGrow: 1, justifyContent: 'flex-start', paddingBottom: 40 },
-  profilePage: { flex: 1, justifyContent: 'center', paddingBottom: 80 },
+  // flexGrow keeps the form centred when it fits and lets it scroll when the keyboard is open.
+  profilePage: { flexGrow: 1, justifyContent: 'center', paddingTop: 16, paddingBottom: 32 },
   profileEyebrow: { color: c.text, fontSize: 11, fontWeight: '800', letterSpacing: 1.6, marginBottom: 12 },
   profileTitle: { color: c.text, fontSize: 30, fontWeight: '800', letterSpacing: -0.4 },
   profileSubtitle: { color: c.text, fontSize: 15, lineHeight: 21, marginTop: 10, marginBottom: 30 },
@@ -1175,6 +1308,8 @@ function createStyles(c: Palette) {
   taskInput: { backgroundColor: c.bg, borderRadius: 14, borderWidth: 1.5, borderColor: c.border, color: c.text, fontSize: 17, paddingHorizontal: 16, paddingVertical: 16, marginBottom: 4 },
   timerSetting: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: c.bg, borderRadius: 16, borderWidth: 1.5, borderColor: c.border, marginTop: 20, padding: 16 },
   themeSetting: { marginTop: 12, marginBottom: 20 },
+  settingStacked: { marginBottom: 0 },
+  soundSetting: { marginTop: 10, marginBottom: 20 },
   timerCopy: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   timerTitle: { color: c.text, fontSize: 15, fontWeight: '700' },
   timerSubtitle: { color: c.text, fontSize: 12, marginTop: 4 },
@@ -1251,6 +1386,9 @@ function createStyles(c: Palette) {
   metaRow: { flexDirection: 'row', alignItems: 'center', marginTop: 8, flexWrap: 'wrap' },
   dot: { width: 7, height: 7, borderRadius: 4, marginRight: 6 },
   meta: { color: c.text, fontSize: 12 },
+  statusMeta: { marginTop: 6 },
+  failedBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 6 },
+  failedBadgeText: { color: '#D85C43', fontSize: 12, fontWeight: '800' },
   overdueMeta: { color: COLORS.danger, fontWeight: '800' },
   metaDivider: { color: c.border, fontSize: 12, marginHorizontal: 7 },
   taskActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
