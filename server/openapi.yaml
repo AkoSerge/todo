@@ -1,0 +1,71 @@
+openapi: 3.0.3
+info:
+  title: Todo API
+  version: 1.0.0
+  description: Accounts and task storage for the Todo app.
+# The app calls these endpoints directly without a gateway token, so gateway security is turned off.
+x-wso2-disable-security: true
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: The service is running.
+  /api/session:
+    post:
+      summary: Create an account, sign in, or restore a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, mode]
+              properties:
+                id:
+                  type: string
+                  description: 'local:<username>:<phone> or google:<google user id>'
+                mode:
+                  type: string
+                  enum: [create, signin, upsert]
+                profile:
+                  type: object
+                  properties:
+                    username: { type: string }
+                    phone: { type: string }
+                    email: { type: string }
+      responses:
+        '200': { description: Signed in. }
+        '201': { description: Account created. }
+        '400': { description: Invalid request. }
+        '404': { description: No account found (sign in). }
+        '409': { description: Account already exists (create). }
+  /api/users/{id}:
+    get:
+      summary: Get a user and their tasks
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: The user. }
+        '404': { description: User not found. }
+  /api/users/{id}/tasks:
+    put:
+      summary: Replace the user's tasks
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tasks]
+              properties:
+                tasks:
+                  type: array
+                  items: { type: object }
+      responses:
+        '200': { description: Saved. }
+        '400': { description: tasks must be an array. }
+        '404': { description: User not found. }
