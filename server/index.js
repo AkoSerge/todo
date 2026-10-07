@@ -3,22 +3,37 @@ const cors = require('cors');
 const express = require('express');
 const { MongoClient } = require('mongodb');
 
-const { MONGODB_URI, MONGODB_DB = 'todo', PORT = 4000 } = process.env;
-if (!MONGODB_URI) {
-  console.error('Missing MONGODB_URI. Copy server/.env.example to server/.env and paste your Atlas connection string.');
-  process.exit(1);
-}
+const { MONGODB_DB = 'todo', PORT = 4000 } = process.env;
+const corsOrigins = process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean);
 
 // User ids come from the login: "local:<username>:<phone>" or "google:<google user id>".
 const USER_ID_PATTERN = /^(local|google):[A-Za-z0-9:._-]{1,128}$/;
 const SESSION_MODES = ['create', 'signin', 'upsert'];
 
-const client = new MongoClient(MONGODB_URI);
-let users;
+let clientPromise;
 
 const app = express();
-app.use(cors());
+app.use(cors(corsOrigins?.length ? { origin: corsOrigins } : undefined));
 app.use(express.json({ limit: '1mb' }));
+
+function getUsersCollection() {
+  const { MONGODB_URI } = process.env;
+  if (!MONGODB_URI) {
+    throw new Error('Missing MONGODB_URI. Set it in the server environment.');
+  }
+
+  if (!clientPromise) {
+    const client = new MongoClient(MONGODB_URI);
+    clientPromise = client.connect()
+      .then(() => client)
+      .catch((error) => {
+        clientPromise = undefined;
+        throw error;
+      });
+  }
+
+  return clientPromise.then((client) => client.db(process.env.MONGODB_DB || MONGODB_DB).collection('users'));
+}
 
 function toPublicUser({ _id, ...user }) {
   return { id: _id, ...user };
@@ -42,6 +57,7 @@ app.post('/api/session', async (req, res) => {
     return res.status(400).json({ error: 'Invalid sign-in request.' });
   }
 
+  const users = await getUsersCollection();
   const now = new Date();
   const existing = await users.findOne({ _id: id });
 
@@ -64,6 +80,7 @@ app.post('/api/session', async (req, res) => {
 });
 
 app.get('/api/users/:id', async (req, res) => {
+  const users = await getUsersCollection();
   const user = await users.findOne({ _id: req.params.id });
   if (!user) return res.status(404).json({ error: 'User not found.' });
   return res.json(toPublicUser(user));
@@ -72,6 +89,7 @@ app.get('/api/users/:id', async (req, res) => {
 app.put('/api/users/:id/tasks', async (req, res) => {
   const { tasks } = req.body ?? {};
   if (!Array.isArray(tasks)) return res.status(400).json({ error: 'tasks must be an array.' });
+  const users = await getUsersCollection();
   const result = await users.updateOne({ _id: req.params.id }, { $set: { tasks, updatedAt: new Date() } });
   if (result.matchedCount === 0) return res.status(404).json({ error: 'User not found.' });
   return res.json({ ok: true });
@@ -82,10 +100,13 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: 'Server error. Please try again.' });
 });
 
-client.connect().then(() => {
-  users = client.db(MONGODB_DB).collection('users');
-  app.listen(Number(PORT), '0.0.0.0', () => console.log(`Todo API listening on port ${PORT}`));
-}).catch((error) => {
-  console.error('Could not connect to MongoDB Atlas:', error.message);
-  process.exit(1);
-});
+module.exports = app;
+
+if (require.main === module) {
+  getUsersCollection().then(() => {
+    app.listen(Number(PORT), '0.0.0.0', () => console.log(`Todo API listening on port ${PORT}`));
+  }).catch((error) => {
+    console.error('Could not connect to MongoDB:', error.message);
+    process.exit(1);
+  });
+}

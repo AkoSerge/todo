@@ -52,36 +52,35 @@ PORT=4000
 
 Important: these variables are required by the Express API in `server/index.js`.
 
-## 4) Backend hosting requirement
+## 4) Deploying the backend on Vercel
 
-The current backend is a standalone Express server in `server/index.js`.
+The Express backend is configured for Vercel's zero-configuration Express support. Its entry point is `server/index.js`, and it exports the Express app for Vercel while retaining the normal `npm start` listener for local development.
 
-Vercel can host a web frontend, but the existing `server/` app will not run directly on Vercel without being adapted to:
+Create a **separate Vercel project** for the backend and configure:
 
-- a Vercel Serverless API route, or
-- a separate backend host such as Render, Railway, Fly.io, or another Node service.
+- **Root Directory:** `server`
+- **Framework Preset:** Express (or Other if Express is not detected)
+- **Build Command:** leave the Vercel default, or use `npm run build`
+- **Install Command:** `npm install`
+- **Output Directory:** leave unset
 
-For production, either:
+Do not use the Expo web build command or the root project directory for this backend deployment. No custom `vercel.json` routing is required for the Express backend.
 
-1. keep the frontend on Vercel and host the API elsewhere, or
-2. move the API into a Vercel-compatible serverless structure (`api/` directory or equivalent), then update CORS and environment configuration.
+Set these environment variables in the backend Vercel project's Production (and Preview, if used) environments:
+
+```env
+MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/<database>
+MONGODB_DB=todo
+```
+
+`PORT` is only used for local development; Vercel supplies the HTTP runtime. After deployment, check `https://<your-backend-domain>/health`, then set the frontend project's `EXPO_PUBLIC_API_URL` to `https://<your-backend-domain>` (no trailing slash).
 
 ## 5) CORS requirements
 
-The API must allow requests from the Vercel frontend domain.
+The backend currently allows cross-origin requests. For production, optionally set `CORS_ORIGINS` in the backend project to a comma-separated list of allowed frontend origins:
 
-The backend currently uses:
-
-```js
-app.use(cors());
-```
-
-This should be restricted to the production frontend origin before launch.
-
-Example:
-
-```js
-app.use(cors({ origin: ['https://your-vercel-app.vercel.app', 'https://your-custom-domain.com'] }));
+```env
+CORS_ORIGINS=https://your-vercel-app.vercel.app,https://your-custom-domain.com
 ```
 
 ## 6) MongoDB requirement
@@ -94,19 +93,9 @@ Required:
 - database name provided via `MONGODB_DB` (defaults to `todo`)
 - database user with read/write permissions to the target collection
 
-## 7) Example Vercel config
+## 7) Frontend deployment is separate
 
-This is a safe starting configuration for the frontend build:
-
-```json
-{
-  "framework": "expo",
-  "buildCommand": "npx expo export --platform web",
-  "outputDirectory": "dist"
-}
-```
-
-If the API is also moved to Vercel, add serverless routing and set API environment variables in the Vercel dashboard.
+The Expo web app and Express API should be deployed as separate Vercel projects. Configure the frontend project to build the Expo web export into `dist`; configure the backend project as described above with `server` as its root directory. Set `EXPO_PUBLIC_API_URL` on the frontend project to the deployed backend origin.
 
 ## 8) Minimum checklist before launch
 
@@ -115,10 +104,11 @@ If the API is also moved to Vercel, add serverless routing and set API environme
 - [ ] `npx expo export --platform web` succeeds
 - [ ] `dist/` is used as the deploy output
 - [ ] `EXPO_PUBLIC_API_URL` is set to the deployed API URL
-- [ ] `MONGODB_URI` is set in the backend environment
-- [ ] API CORS allows the Vercel frontend origin
+- [ ] The backend Vercel project uses `server` as its root directory
+- [ ] `MONGODB_URI` is set in the backend project's environment
+- [ ] The backend `/health` endpoint responds successfully
 - [ ] Production API is reachable from the deployed web app
 
 ## 9) Important warning
 
-This project is not a plain static site. It is a web build of a React Native app plus a backend service. The app will only be deployable on Vercel after the backend is either hosted separately or migrated into a Vercel-compatible form.
+This repository contains two separately deployed projects: an Expo web frontend and an Express API. Deploy each from its own Vercel project with the appropriate root directory and environment variables.
